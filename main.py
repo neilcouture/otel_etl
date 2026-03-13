@@ -127,6 +127,105 @@ def run_profiler(
     return schema
 
 
+def run_profiler_from_dataframe(
+    raw_df: pd.DataFrame,
+    output_path: str = "schema_config.yaml",
+    profiling_window_hours: float = DEFAULT_PROFILING_WINDOW_HOURS,
+    cardinality_thresholds: dict[str, int] | None = None,
+    top_n: int = DEFAULT_TOP_N,
+) -> SchemaConfig:
+    """Run the profiler against an in-memory DataFrame to generate schema config.
+
+    Works identically to run_profiler() but analyses a DataFrame instead of
+    querying a live Prometheus/Datadog instance.
+
+    Args:
+        raw_df: DataFrame with columns: timestamp, metric, labels (dict or str), value.
+        output_path: Path to write schema config YAML.
+        profiling_window_hours: Recorded in schema metadata.
+        cardinality_thresholds: Custom tier thresholds.
+        top_n: Number of top values to capture per high-cardinality label.
+
+    Returns:
+        Generated SchemaConfig.
+    """
+    from collections import Counter, defaultdict
+    from otel_etl.config.defaults import get_tier, get_action
+
+    if raw_df.empty:
+        raise ValueError("Cannot profile an empty DataFrame")
+
+    thresholds: CardinalityThresholds = DEFAULT_CARDINALITY_THRESHOLDS.copy()
+    if cardinality_thresholds:
+        thresholds.update(cardinality_thresholds)
+
+    # Normalize labels if they are strings
+    labels_col = raw_df["labels"]
+    if isinstance(labels_col.iloc[0], str):
+        import ast
+        labels_col = labels_col.apply(ast.literal_eval)
+
+    # Collect label values per (metric, label_key)
+    metric_labels: dict[str, dict[str, Counter]] = defaultdict(lambda: defaultdict(Counter))
+    metric_names = set()
+
+    for metric, labels in zip(raw_df["metric"], labels_col):
+        metric_names.add(metric)
+        if isinstance(labels, dict):
+            for k, v in labels.items():
+                metric_labels[metric][k][v] += 1
+
+    # Build families
+    families = {}
+    for metric_name in sorted(metric_names):
+        family_name = extract_metric_family(metric_name)
+        otel_type = classify_metric_type(metric_name)
+        if family_name not in families:
+            families[family_name] = {
+                "name": family_name,
+                "type": otel_type,
+                "metrics": [],
+            }
+        families[family_name]["metrics"].append(metric_name)
+
+    # Build cardinality results
+    cardinality_results = {}
+    for family_name, family in families.items():
+        family_cardinality = {}
+        merged_labels: dict[str, Counter] = defaultdict(Counter)
+        for metric_name in family["metrics"]:
+            for label_key, value_counts in metric_labels.get(metric_name, {}).items():
+                merged_labels[label_key].update(value_counts)
+
+        for label_key, value_counts in merged_labels.items():
+            cardinality = len(value_counts)
+            tier = get_tier(cardinality, thresholds)
+            action = get_action(tier)
+            top_values = [v for v, _ in value_counts.most_common(top_n)]
+            family_cardinality[label_key] = {
+                "label": label_key,
+                "cardinality": cardinality,
+                "tier": tier,
+                "action": action,
+                "top_values": top_values if action == "top_n" else None,
+            }
+        cardinality_results[family_name] = family_cardinality
+
+    logger.info(
+        "DataFrame profile: %d families, %d metrics, %d rows analyzed",
+        len(families), len(metric_names), len(raw_df),
+    )
+
+    schema = generate_schema(
+        families, cardinality_results, thresholds, profiling_window_hours
+    )
+
+    save_schema(schema, output_path)
+    logger.info(f"Schema saved to {output_path}")
+
+    return schema
+
+
 def denormalize_metrics(
     raw_df: pd.DataFrame,
     schema_config: str | SchemaConfig | None = None,
@@ -165,6 +264,21 @@ def denormalize_metrics(
     schema = _load_schema_config(schema_config)
     registry = _load_column_registry(column_registry)
     overrides = _load_overrides(overrides_path)
+
+    # When loaded from CSV, labels and timestamps may be strings — normalize
+    if not raw_df.empty:
+        needs_copy = False
+        if isinstance(raw_df["labels"].iloc[0], str):
+            needs_copy = True
+        if not pd.api.types.is_datetime64_any_dtype(raw_df["timestamp"]):
+            needs_copy = True
+        if needs_copy:
+            raw_df = raw_df.copy()
+        if isinstance(raw_df["labels"].iloc[0], str):
+            import ast
+            raw_df["labels"] = raw_df["labels"].apply(ast.literal_eval)
+        if not pd.api.types.is_datetime64_any_dtype(raw_df["timestamp"]):
+            raw_df["timestamp"] = pd.to_datetime(raw_df["timestamp"])
 
     logger.info(f"Processing {len(raw_df)} raw metric rows")
 
